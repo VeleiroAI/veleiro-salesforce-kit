@@ -12,6 +12,13 @@
  * Fallback: the legacy public Veleiro_Config__c.Api_Token__c field, only when the
  * protected copy did not succeed. It is cleared after a successful copy. Callouts
  * that still use this token go only to the original packaged Named Credentials.
+ *
+ * Platform auth takes two transactions. A ConnectApi credential write leaves
+ * uncommitted work, so the GET /clients probe cannot run after it in the same
+ * transaction ("You have uncommitted work pending"). preparePlatformAuth() writes
+ * the principal and records Platform_Write_Pending__c; confirmPlatformAuth() runs
+ * later in its own transaction, calls out before any DML, and only then marks
+ * Platform_Auth__c.
  */
 public with sharing class VeleiroCredentialStore {
 
@@ -19,8 +26,14 @@ public with sharing class VeleiroCredentialStore {
     public static final String PRINCIPAL = 'VeleiroPrincipal';
     public static final String TOKEN_PARAMETER = 'ApiToken';
 
-    // Tests cannot call ConnectApi. Null means "skip the platform write".
-    @TestVisible private static Boolean platformWriteOverride;
+    /** Writes the External Credential principal. The real one calls ConnectApi. */
+    public interface CredentialWriter {
+        void write(ConnectApi.CredentialInput input);
+    }
+
+    // ConnectApi is not available in data-siloed tests. Tests inject a writer here;
+    // without one, a test run skips the platform write.
+    @TestVisible private static CredentialWriter testWriter;
     @TestVisible private static Boolean failProtectedWrite = false;
 
     public static Boolean hasToken() {
@@ -41,6 +54,12 @@ public with sharing class VeleiroCredentialStore {
     public static Boolean platformAuthReady() {
         Veleiro_Secret__c secret = Veleiro_Secret__c.getOrgDefaults();
         return secret != null && secret.Platform_Auth__c == true && String.isNotBlank(secret.Api_Token__c);
+    }
+
+    /** True after a principal write succeeded in an earlier transaction and is not confirmed yet. */
+    public static Boolean platformWritePending() {
+        Veleiro_Secret__c secret = Veleiro_Secret__c.getOrgDefaults();
+        return secret != null && secret.Platform_Write_Pending__c == true;
     }
 
     /**
@@ -68,13 +87,18 @@ public with sharing class VeleiroCredentialStore {
         return true;
     }
 
-    /** Admin save. ConnectApi runs before any DML. A platform failure still stores the token. */
-    public static void saveNewToken(String token) {
-        if (String.isBlank(token)) return;
+    /**
+     * Admin save. ConnectApi runs before any DML. A platform failure still stores the token.
+     * No callout here: the new token is confirmed by confirmPlatformAuth() in a later
+     * transaction. Returns true when the principal write succeeded.
+     */
+    public static Boolean saveNewToken(String token) {
+        if (String.isBlank(token)) return false;
         String clean = token.trim();
-        Boolean platform = attemptPlatform(clean);
-        writeProtected(clean, platform);
+        Boolean written = writePlatformCredential(clean);
+        writeProtected(clean, false, written);
         clearLegacyTokens();
+        return written;
     }
 
     /**
@@ -85,17 +109,14 @@ public with sharing class VeleiroCredentialStore {
      */
     public static Boolean writePlatformCredential(String token) {
         if (String.isBlank(token)) return false;
-        if (Test.isRunningTest()) {
-            if (platformWriteOverride == true) return true;
-            if (platformWriteOverride == false) {
-                recordPlatformFailure(new VeleiroApiClient.VeleiroApiException('Platform credential write failed.'));
-                return false;
-            }
-            return false;
-        }
+        if (Test.isRunningTest() && testWriter == null) return false;
         try {
             String externalName = VeleiroSyncConfig.namespacePrefix() + EXTERNAL_CREDENTIAL;
             ConnectApi.CredentialInput input = credentialInput(externalName, token);
+            if (testWriter != null) {
+                testWriter.write(input);
+                return true;
+            }
             try {
                 ConnectApi.NamedCredentials.updateCredential(input);
             } catch (Exception updateFailed) {
@@ -109,16 +130,31 @@ public with sharing class VeleiroCredentialStore {
     }
 
     /**
-     * Copies the stored token into the External Credential and confirms it
-     * with GET /clients. Returns true only when platform auth is ready.
-     * A failed write or probe leaves the protected token in place and records
+     * Step one of platform auth: copies the stored token into the External Credential
+     * and records whether that write succeeded. Makes no callout, because the write
+     * leaves uncommitted work. Returns true when the write succeeded (or platform auth
+     * is already ready). A failed write leaves the protected token in place and records
      * the exception type. Never called from a page-load method.
      */
-    public static Boolean finishPlatformAuth() {
+    public static Boolean preparePlatformAuth() {
         if (platformAuthReady()) return true;
         String token = readToken();
         if (String.isBlank(token)) return false;
-        if (!writePlatformCredential(token)) return false;
+        Boolean written = writePlatformCredential(token);
+        setPlatformWritePending(written);
+        return written;
+    }
+
+    /**
+     * Step two of platform auth, in a new transaction: GET /clients through the secure
+     * Named Credential, then (after the callout) marks platform auth ready. Probes only
+     * when an earlier principal write succeeded, so a stale principal never confirms a
+     * different token. Returns true only when platform auth is ready. A failed probe
+     * records the exception type and keeps the legacy credential path.
+     */
+    public static Boolean confirmPlatformAuth() {
+        if (platformAuthReady()) return true;
+        if (!platformWritePending() || String.isBlank(readToken())) return false;
         try {
             VeleiroApiClient.probeSecureCredential();
         } catch (Exception e) {
@@ -142,17 +178,7 @@ public with sharing class VeleiroCredentialStore {
         String token = protectedToken();
         if (String.isBlank(token)) token = readLegacyToken();
         if (String.isBlank(token)) return;
-        writeProtected(token, true);
-    }
-
-    private static Boolean attemptPlatform(String token) {
-        if (!writePlatformCredential(token)) return false;
-        try {
-            VeleiroApiClient.probeSecureCredential();
-            return true;
-        } catch (Exception e) {
-            return false;
-        }
+        writeProtected(token, true, false);
     }
 
     private static String protectedToken() {
@@ -176,6 +202,10 @@ public with sharing class VeleiroCredentialStore {
     }
 
     private static void writeProtected(String token, Boolean platform) {
+        writeProtected(token, platform, false);
+    }
+
+    private static void writeProtected(String token, Boolean platform, Boolean pending) {
         if (Test.isRunningTest() && failProtectedWrite == true) {
             throw new VeleiroApiClient.VeleiroApiException('Protected token write failed.');
         }
@@ -185,8 +215,22 @@ public with sharing class VeleiroCredentialStore {
         }
         secret.Api_Token__c = token;
         secret.Platform_Auth__c = platform == true;
+        secret.Platform_Write_Pending__c = pending == true;
         // System mode on purpose: Veleiro_Secret__c is a protected setting that only this
         // package can reach. Subscribers cannot be granted access to it, which is the point.
+        Database.upsert(secret, true, AccessLevel.SYSTEM_MODE);
+    }
+
+    private static void setPlatformWritePending(Boolean pending) {
+        Veleiro_Secret__c secret = Veleiro_Secret__c.getOrgDefaults();
+        Boolean value = pending == true;
+        if (secret == null || secret.Id == null) {
+            if (!value) return;
+            secret = new Veleiro_Secret__c(SetupOwnerId = UserInfo.getOrganizationId());
+        }
+        if (secret.Platform_Write_Pending__c == value) return;
+        secret.Platform_Write_Pending__c = value;
+        // System mode on purpose, as in writeProtected(): protected, package-only setting.
         Database.upsert(secret, true, AccessLevel.SYSTEM_MODE);
     }
 

@@ -7,6 +7,7 @@ import getState from '@salesforce/apex/VeleiroOnboardingController.getState';
 import skipStep from '@salesforce/apex/VeleiroOnboardingController.skipStep';
 import saveToken from '@salesforce/apex/VeleiroMappingController.saveToken';
 import secureLegacyToken from '@salesforce/apex/VeleiroMappingController.secureLegacyToken';
+import confirmSecureConnection from '@salesforce/apex/VeleiroMappingController.confirmSecureConnection';
 import saveEnvironment from '@salesforce/apex/VeleiroMappingController.saveEnvironment';
 import getSyncConfig from '@salesforce/apex/VeleiroMappingController.getSyncConfig';
 import saveSyncConfig from '@salesforce/apex/VeleiroMappingController.saveSyncConfig';
@@ -180,6 +181,7 @@ export default class VeleiroOnboarding extends NavigationMixin(LightningElement)
         this.saving = true;
         try {
             const moved = await secureLegacyToken();
+            await this.confirmSecure();
             await this.load(false);
             if (this.state && this.state.platformAuthReady) {
                 this.toast(T.platformSetupDone, '', 'success');
@@ -199,6 +201,17 @@ export default class VeleiroOnboarding extends NavigationMixin(LightningElement)
         }
     }
 
+    // Second Apex call, so the secure credential probe runs in its own transaction after
+    // the credential write. A failure here only means the secure connection is not ready;
+    // the state loaded next reports it.
+    async confirmSecure() {
+        try {
+            await confirmSecureConnection();
+        } catch (e) {
+            // Reported through needsPlatformSetup.
+        }
+    }
+
     async handleSaveToken() {
         if (!this.tokenInput) {
             this.toast(T.tokenMissing, T.tokenMissingMsg, 'warning');
@@ -209,6 +222,7 @@ export default class VeleiroOnboarding extends NavigationMixin(LightningElement)
             await saveEnvironment({ environment: this.environment });
             await saveToken({ token: this.tokenInput });
             this.tokenInput = '';
+            await this.confirmSecure();
             await this.load(true);                     // verifica de verdad contra la API
             const conn = (this.state.steps || []).find((s) => s.key === 'connection');
             if (conn && conn.state === 'done') {

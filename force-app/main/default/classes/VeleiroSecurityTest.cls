@@ -22,6 +22,29 @@ private class VeleiroSecurityTest {
         }
     }
 
+    /**
+     * Stands in for ConnectApi.NamedCredentials, which data-siloed tests cannot call.
+     * Like the real write, it leaves uncommitted work in the transaction, so any
+     * callout after it in the same transaction fails with a CalloutException.
+     */
+    private class FakeCredentialWriter implements VeleiroCredentialStore.CredentialWriter {
+        public Integer writes = 0;
+        public Boolean fail = false;
+        public ConnectApi.CredentialInput last;
+        public void write(ConnectApi.CredentialInput input) {
+            writes++;
+            last = input;
+            if (fail) throw new VeleiroApiClient.VeleiroApiException('Platform credential write failed.');
+            insert new Veleiro_Field_Mapping__c(Name = 'Pending credential write', Active__c = false);
+        }
+    }
+
+    private static FakeCredentialWriter useFakeWriter() {
+        FakeCredentialWriter writer = new FakeCredentialWriter();
+        VeleiroCredentialStore.testWriter = writer;
+        return writer;
+    }
+
     private static Veleiro_Config__c orgConfig(String token, String baseUrl, String appBase) {
         return new Veleiro_Config__c(
             SetupOwnerId = UserInfo.getOrganizationId(),
@@ -143,15 +166,21 @@ private class VeleiroSecurityTest {
         System.runAs(VeleiroTestAccess.user()) {
             insert orgConfig('vlr_platform', 'callout:Veleiro_API/api/v1', 'https://app.veleiro.ai');
             System.assertEquals(true, VeleiroCredentialStore.migrateLegacyToken());
-            VeleiroCredentialStore.platformWriteOverride = true;
+            FakeCredentialWriter writer = useFakeWriter();
             CaptureMock mock = new CaptureMock();
             Test.setMock(HttpCalloutMock.class, mock);
 
+            // The first job writes the principal and queues the probe job, which
+            // runs in its own transaction when the test stops.
             Test.startTest();
             new VeleiroCredentialMigration().execute(null);
+            System.assertEquals(null, mock.endpoint, 'no callout in the job that wrote the credential');
             Test.stopTest();
 
+            System.assertEquals(1, writer.writes);
+            System.assertEquals(null, Veleiro_Config__c.getOrgDefaults().Last_Sync_Error__c);
             System.assertEquals(true, VeleiroCredentialStore.platformAuthReady());
+            System.assertEquals(false, VeleiroCredentialStore.platformWritePending());
             System.assert(mock.endpoint != null && mock.endpoint.contains('Veleiro_API_Secure'), mock.endpoint);
             System.assertEquals(null, mock.authorization);
         }
@@ -162,7 +191,7 @@ private class VeleiroSecurityTest {
         System.runAs(VeleiroTestAccess.user()) {
             insert orgConfig('vlr_platform', 'callout:Veleiro_API_Beta/api/v1', 'https://app.beta.veleiro.dev');
             VeleiroCredentialStore.migrateLegacyToken();
-            VeleiroCredentialStore.platformWriteOverride = true;
+            useFakeWriter();
             CaptureMock mock = new CaptureMock();
             mock.status = 401;
             mock.body = '{"error":{"code":"invalid_token","message":"vlr_should_not_leak"}}';
@@ -173,8 +202,13 @@ private class VeleiroSecurityTest {
             Test.stopTest();
 
             System.assertEquals(false, VeleiroCredentialStore.platformAuthReady());
+            System.assert(mock.endpoint != null && mock.endpoint.contains('Veleiro_API_Beta_Secure'), mock.endpoint);
             System.assert(VeleiroApiClient.apiBaseConfigured().contains('Veleiro_API_Beta'));
             System.assert(!VeleiroApiClient.apiBaseConfigured().contains('Secure'));
+            String err = Veleiro_Config__c.getOrgDefaults().Last_Sync_Error__c;
+            System.assert(err != null && err.contains('External Credential setup skipped:'), err);
+            System.assert(!err.contains('CalloutException'), 'the probe ran in its own transaction: ' + err);
+            System.assert(!err.contains('vlr_should_not_leak'), err);
         }
     }
 
@@ -213,13 +247,15 @@ private class VeleiroSecurityTest {
     @isTest
     static void saveTokenFinishesPlatformAuthWhenTheProbeSucceeds() {
         System.runAs(VeleiroTestAccess.admin()) {
-            VeleiroCredentialStore.platformWriteOverride = true;
+            useFakeWriter();
             Test.setMock(HttpCalloutMock.class, new VeleiroApiMock());
 
-            // startTest: the permission set assignment above is a DML, and a callout after it
-            // in the same context fails with "uncommitted work pending".
-            Test.startTest();
+            // The save writes the credential and makes no callout. The page then confirms it in a
+            // second transaction (startTest), where the probe runs before any DML.
             VeleiroMappingController.saveToken('vlr_saved');
+            System.assertEquals(false, VeleiroCredentialStore.platformAuthReady());
+            Test.startTest();
+            System.assertEquals(true, VeleiroMappingController.confirmSecureConnection());
             Test.stopTest();
 
             System.assertEquals('vlr_saved', Veleiro_Secret__c.getOrgDefaults().Api_Token__c);
@@ -231,14 +267,15 @@ private class VeleiroSecurityTest {
     @isTest
     static void saveTokenKeepsTheProtectedCopyWhenTheProbeFails() {
         System.runAs(VeleiroTestAccess.admin()) {
-            VeleiroCredentialStore.platformWriteOverride = true;
+            useFakeWriter();
             VeleiroApiMock mock = new VeleiroApiMock();
             mock.overrideStatus = 401;
             mock.overrideBody = '{"error":{"code":"invalid_token"}}';
             Test.setMock(HttpCalloutMock.class, mock);
 
-            Test.startTest();
             VeleiroMappingController.saveToken('vlr_saved');
+            Test.startTest();
+            System.assertEquals(false, VeleiroMappingController.confirmSecureConnection());
             Test.stopTest();
 
             System.assertEquals('vlr_saved', Veleiro_Secret__c.getOrgDefaults().Api_Token__c,
@@ -378,13 +415,27 @@ private class VeleiroSecurityTest {
             System.assertEquals(false, VeleiroCredentialStore.hasLegacyToken());
             System.assertEquals(false, VeleiroCredentialStore.platformAuthReady());
 
-            VeleiroCredentialStore.platformWriteOverride = true;
-            Test.setMock(HttpCalloutMock.class, new CaptureMock());
-            Test.startTest();
+            FakeCredentialWriter writer = useFakeWriter();
+            CaptureMock mock = new CaptureMock();
+            Test.setMock(HttpCalloutMock.class, mock);
+
+            // First Apex call from the page: credential write, no callout.
             System.assertEquals(true, VeleiroMappingController.secureLegacyToken());
+            System.assertEquals(1, writer.writes);
+            System.assertEquals(null, mock.endpoint);
+            System.assertEquals(true, VeleiroCredentialStore.platformWritePending());
+            System.assertEquals(false, VeleiroCredentialStore.platformAuthReady());
+
+            // Second Apex call: a new transaction that calls out before any DML.
+            Test.startTest();
+            System.assertEquals(true, VeleiroMappingController.confirmSecureConnection());
             Test.stopTest();
 
+            System.assert(mock.endpoint != null && mock.endpoint.contains('Veleiro_API_Secure'), mock.endpoint);
+            System.assertEquals(null, mock.authorization);
+            System.assertEquals(null, Veleiro_Config__c.getOrgDefaults().Last_Sync_Error__c);
             System.assertEquals(true, VeleiroCredentialStore.platformAuthReady());
+            System.assertEquals(false, VeleiroCredentialStore.platformWritePending());
             System.assertEquals('vlr_legacy', Veleiro_Secret__c.getOrgDefaults().Api_Token__c);
             System.assertEquals(null, Veleiro_Config__c.getOrgDefaults().Api_Token__c);
             System.assertEquals(true, VeleiroApiClient.hasToken());
@@ -392,14 +443,128 @@ private class VeleiroSecurityTest {
     }
 
     @isTest
+    static void adminButtonMakesNoCalloutInTheTransactionThatWritesTheCredential() {
+        System.runAs(VeleiroTestAccess.admin()) {
+            insert orgConfig('vlr_legacy', 'callout:Veleiro_API/api/v1', 'https://app.veleiro.ai');
+            FakeCredentialWriter writer = useFakeWriter();
+            CaptureMock mock = new CaptureMock();
+            Test.setMock(HttpCalloutMock.class, mock);
+
+            // Migration DML and the credential write in one transaction, as on the button click.
+            Test.startTest();
+            System.assertEquals(true, VeleiroMappingController.secureLegacyToken());
+            Test.stopTest();
+
+            System.assertEquals(1, writer.writes);
+            System.assertEquals(null, mock.endpoint, 'a probe here would hit uncommitted work pending');
+            System.assertEquals(null, Veleiro_Config__c.getOrgDefaults().Last_Sync_Error__c);
+            System.assertEquals(true, VeleiroCredentialStore.platformWritePending());
+            System.assertEquals(false, VeleiroCredentialStore.platformAuthReady());
+            System.assertEquals('vlr_legacy', Veleiro_Secret__c.getOrgDefaults().Api_Token__c);
+            System.assertEquals(null, Veleiro_Config__c.getOrgDefaults().Api_Token__c);
+        }
+    }
+
+    @isTest
+    static void aProbeInTheSameTransactionAsTheWriteIsRefusedByThePlatform() {
+        // Documents why the setup takes two transactions.
+        System.runAs(VeleiroTestAccess.admin()) {
+            insert orgConfig('vlr_legacy', 'callout:Veleiro_API/api/v1', 'https://app.veleiro.ai');
+            System.assertEquals(true, VeleiroCredentialStore.migrateLegacyToken());
+            useFakeWriter();
+            Test.setMock(HttpCalloutMock.class, new CaptureMock());
+
+            Test.startTest();
+            System.assertEquals(true, VeleiroCredentialStore.preparePlatformAuth());
+            System.assertEquals(false, VeleiroCredentialStore.confirmPlatformAuth());
+            Test.stopTest();
+
+            System.assertEquals(false, VeleiroCredentialStore.platformAuthReady());
+            String err = Veleiro_Config__c.getOrgDefaults().Last_Sync_Error__c;
+            System.assert(err != null && err.contains('CalloutException'), err);
+            System.assert(!err.contains('vlr_legacy'), err);
+        }
+    }
+
+    @isTest
+    static void savedTokenIsConfirmedInASecondTransaction() {
+        System.runAs(VeleiroTestAccess.admin()) {
+            insert orgConfig(null, 'callout:Veleiro_API/api/v1', 'https://app.veleiro.ai');
+            FakeCredentialWriter writer = useFakeWriter();
+            CaptureMock mock = new CaptureMock();
+            Test.setMock(HttpCalloutMock.class, mock);
+
+            VeleiroMappingController.saveToken('  vlr_new_token  ');
+            System.assertEquals(1, writer.writes);
+            System.assertEquals(null, mock.endpoint);
+            System.assertEquals('vlr_new_token', Veleiro_Secret__c.getOrgDefaults().Api_Token__c);
+            System.assertEquals(true, VeleiroCredentialStore.platformWritePending());
+            System.assertEquals(false, VeleiroCredentialStore.platformAuthReady());
+            System.assertEquals(VeleiroCredentialStore.PRINCIPAL, writer.last.principalName);
+            System.assert(writer.last.externalCredential.endsWith(VeleiroCredentialStore.EXTERNAL_CREDENTIAL));
+            ConnectApi.CredentialValueInput value = writer.last.credentials.get(VeleiroCredentialStore.TOKEN_PARAMETER);
+            System.assertEquals(true, value.encrypted);
+            System.assertEquals('vlr_new_token', value.value);
+
+            Test.startTest();
+            System.assertEquals(true, VeleiroMappingController.confirmSecureConnection());
+            Test.stopTest();
+
+            System.assert(mock.endpoint != null && mock.endpoint.contains('Veleiro_API_Secure'), mock.endpoint);
+            System.assertEquals(null, Veleiro_Config__c.getOrgDefaults().Last_Sync_Error__c);
+            System.assertEquals(true, VeleiroCredentialStore.platformAuthReady());
+            System.assertEquals(false, VeleiroCredentialStore.platformWritePending());
+            System.assertEquals('vlr_new_token', Veleiro_Secret__c.getOrgDefaults().Api_Token__c);
+        }
+    }
+
+    @isTest
+    static void aFailedWriteIsNeverConfirmedAgainstAnOlderPrincipal() {
+        System.runAs(VeleiroTestAccess.admin()) {
+            insert orgConfig(null, 'callout:Veleiro_API/api/v1', 'https://app.veleiro.ai');
+            FakeCredentialWriter writer = useFakeWriter();
+            writer.fail = true;
+            CaptureMock mock = new CaptureMock();
+            Test.setMock(HttpCalloutMock.class, mock);
+
+            VeleiroMappingController.saveToken('vlr_new_token');
+
+            Test.startTest();
+            System.assertEquals(false, VeleiroMappingController.confirmSecureConnection());
+            Test.stopTest();
+
+            System.assertEquals(null, mock.endpoint, 'no probe without a successful write');
+            System.assertEquals(false, VeleiroCredentialStore.platformAuthReady());
+            System.assertEquals(false, VeleiroCredentialStore.platformWritePending());
+            System.assertEquals('vlr_new_token', Veleiro_Secret__c.getOrgDefaults().Api_Token__c);
+            System.assertEquals(true, VeleiroApiClient.hasToken());
+        }
+    }
+
+    @isTest
+    static void standardUserCannotConfirmTheSecureConnection() {
+        System.runAs(VeleiroTestAccess.user()) {
+            User u = standardUser();
+            System.runAs(u) {
+                Boolean blocked = false;
+                try { VeleiroMappingController.confirmSecureConnection(); } catch (AuraHandledException e) { blocked = true; }
+                System.assertEquals(true, blocked, 'confirming the secure connection needs an administrator');
+            }
+        }
+    }
+
+    @isTest
     static void adminButtonRecordsAPlatformWriteFailureWithoutTheToken() {
         System.runAs(VeleiroTestAccess.admin()) {
             insert orgConfig('vlr_secret_token', 'callout:Veleiro_API/api/v1', 'https://app.veleiro.ai');
-            VeleiroCredentialStore.platformWriteOverride = false;
+            useFakeWriter().fail = true;
 
             Test.startTest();
             System.assertEquals(true, VeleiroMappingController.secureLegacyToken());
             Test.stopTest();
+
+            System.assertEquals(false, VeleiroCredentialStore.platformWritePending());
+            System.assertEquals(false, VeleiroCredentialStore.confirmPlatformAuth());
 
             System.assertEquals('vlr_secret_token', Veleiro_Secret__c.getOrgDefaults().Api_Token__c);
             System.assertEquals(null, Veleiro_Config__c.getOrgDefaults().Api_Token__c);
@@ -416,7 +581,7 @@ private class VeleiroSecurityTest {
         System.runAs(VeleiroTestAccess.admin()) {
             insert orgConfig('vlr_secret_token', 'callout:Veleiro_API/api/v1', 'https://app.veleiro.ai');
             System.assertEquals(true, VeleiroCredentialStore.migrateLegacyToken());
-            VeleiroCredentialStore.platformWriteOverride = false;
+            useFakeWriter().fail = true;
 
             Test.startTest();
             new VeleiroCredentialMigration().execute(null);

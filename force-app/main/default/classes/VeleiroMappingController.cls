@@ -362,19 +362,33 @@ public with sharing class VeleiroMappingController {
 
     /**
      * Moves a token left in the public Veleiro_Config__c field (1.5.0 - 1.8.0) into the
-     * protected setting, then retries the External Credential write and probe when
-     * platform auth is not ready yet. The post-install script does the protected copy
-     * on upgrade, but the install user usually cannot write the External Credential.
-     * This is the explicit admin button for that remaining step. Never called on page load.
+     * protected setting, then retries the External Credential write when platform auth
+     * is not ready yet. The post-install script does the protected copy on upgrade, but
+     * the install user usually cannot write the External Credential. This is the explicit
+     * admin button for that remaining step. Never called on page load.
+     * Makes no callout: the page then calls confirmSecureConnection(), which probes the
+     * secure credential in its own transaction.
      * Returns true when a token is stored in the protected setting (or was already there).
-     * A failed platform probe does not undo that copy.
+     * A failed platform write does not undo that copy.
      */
     @AuraEnabled
     public static Boolean secureLegacyToken() {
         VeleiroSecurity.assertCanManageSetup();
         Boolean migrated = VeleiroCredentialStore.migrateLegacyToken();
-        VeleiroCredentialStore.finishPlatformAuth();
+        VeleiroCredentialStore.preparePlatformAuth();
         return migrated && VeleiroCredentialStore.hasToken();
+    }
+
+    /**
+     * Second step of the secure connection setup, after secureLegacyToken() or saveToken().
+     * Runs in its own transaction so the GET /clients probe is the first thing it does;
+     * the earlier ConnectApi write has been committed by then. Probes only when that write
+     * succeeded. Returns true when platform auth is ready. Never called on page load.
+     */
+    @AuraEnabled
+    public static Boolean confirmSecureConnection() {
+        VeleiroSecurity.assertCanManageSetup();
+        return VeleiroCredentialStore.confirmPlatformAuth();
     }
 
     // An admin pressed Save: a good moment to finish a pending migration. Never blocks the save.
