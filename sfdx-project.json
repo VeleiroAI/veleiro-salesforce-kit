@@ -2,11 +2,11 @@
   "packageDirectories": [
     {
       "versionName": "Secure connection fix",
-      "versionNumber": "1.10.1.NEXT",
+      "versionNumber": "1.11.0.NEXT",
       "path": "force-app",
       "default": true,
       "package": "Veleiro Salesforce Kit",
-      "versionDescription": "Patch on 1.10.0: the External Credential write and the GET /clients probe run in separate transactions, so the secure connection setup no longer fails with uncommitted work pending. Applies to the admin button, the token save, and the post-install job.",
+      "versionDescription": "On top of 1.10.0: the External Credential write and the GET /clients probe run in separate transactions, so the secure connection setup no longer fails with uncommitted work pending. Applies to the admin button, the token save, and the post-install job.",
       "ancestorVersion": "1.10.0.RELEASED",
       "postInstallScript": "VeleiroPostInstall"
     }
