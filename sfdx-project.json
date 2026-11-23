@@ -1,13 +1,13 @@
 {
   "packageDirectories": [
     {
-      "versionName": "Security review fixes",
-      "versionNumber": "1.10.0.NEXT",
+      "versionName": "Secure connection fix",
+      "versionNumber": "1.10.1.NEXT",
       "path": "force-app",
       "default": true,
       "package": "Veleiro Salesforce Kit",
-      "versionDescription": "Security review fixes on top of 1.9.0: setup queries run in user mode and fail closed, auto-sync batches make every callout before the single DML, and the package's own configuration writes (Veleiro_Config__c, protected Veleiro_Secret__c) declare system mode with a justification at each site. Upgrades from 1.9.0 keep subscriber data and flow activation.",
-      "ancestorVersion": "HIGHEST",
+      "versionDescription": "Patch on 1.10.0: the External Credential write and the GET /clients probe run in separate transactions, so the secure connection setup no longer fails with uncommitted work pending. Applies to the admin button, the token save, and the post-install job.",
+      "ancestorVersion": "1.10.0.RELEASED",
       "postInstallScript": "VeleiroPostInstall"
     }
   ],
