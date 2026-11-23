@@ -14,6 +14,7 @@ import saveSyncConfig from '@salesforce/apex/VeleiroMappingController.saveSyncCo
 import getStatus from '@salesforce/apex/VeleiroMappingController.getStatus';
 import saveToken from '@salesforce/apex/VeleiroMappingController.saveToken';
 import secureLegacyToken from '@salesforce/apex/VeleiroMappingController.secureLegacyToken';
+import confirmSecureConnection from '@salesforce/apex/VeleiroMappingController.confirmSecureConnection';
 import saveEnvironment from '@salesforce/apex/VeleiroMappingController.saveEnvironment';
 
 const ENTITY_OPTIONS = [
@@ -144,10 +145,18 @@ export default class VeleiroMappingHome extends LightningElement {
 
     handleTokenChange(event) { this.tokenInput = event.detail.value; }
 
+    // Second Apex call, so the secure credential probe runs in its own transaction after the
+    // credential write. A failure only means the secure connection is not ready yet; the
+    // status loaded next reports it.
+    confirmSecure() {
+        return confirmSecureConnection().catch(() => null);
+    }
+
     // Mueve el token viejo y/o termina la External Credential. Es un clic del admin, nunca la carga.
     handleSecureToken() {
         this.checking = true;
         secureLegacyToken()
+            .then(() => this.confirmSecure())
             .then(() => this.loadStatus())
             .then(() => {
                 let title = 'Token moved to protected storage';
@@ -179,8 +188,9 @@ export default class VeleiroMappingHome extends LightningElement {
         step
             .then(() => {
                 this.tokenInput = '';
-                return this.loadStatus();
+                return token ? this.confirmSecure() : null;
             })
+            .then(() => this.loadStatus())
             .then(() => {
                 if (this.connected) this.editingConn = false; // conectó -> colapsa a la vista resumida
                 this.dispatchEvent(new ShowToastEvent({

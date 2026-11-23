@@ -66,7 +66,7 @@ Browser links ("Open in Veleiro") allow only `https://app.veleiro.ai` and `https
 
 ## Who can change setup
 
-`saveToken`, `saveEnvironment`, `saveSyncConfig`, `saveMappings`, `secureLegacyToken`, `skipStep`, and `VeleiroSeed.seed()` require Customize Application (so the installing system administrator still can) or the custom permission `Veleiro_Manage_Setup` from the packaged permission set `Veleiro Admin`.
+`saveToken`, `saveEnvironment`, `saveSyncConfig`, `saveMappings`, `secureLegacyToken`, `confirmSecureConnection`, `skipStep`, and `VeleiroSeed.seed()` require Customize Application (so the installing system administrator still can) or the custom permission `Veleiro_Manage_Setup` from the packaged permission set `Veleiro Admin`.
 
 Least privilege is in the permission sets, not only in Apex. `Veleiro Integration Access` reads `Veleiro_Field_Mapping__c` and nothing more: no create, edit, or delete, no View All, no Modify All, and no Veleiro Setup or Veleiro Mappings tab. A sales user cannot change what the sync sends, through the UI, the API, or Data Loader. `Veleiro Admin` carries create, edit, and delete on mappings (still no View All or Modify All), the edit access on the mapping fields, and the two setup tabs.
 
