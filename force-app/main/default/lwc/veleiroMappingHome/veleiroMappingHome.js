@@ -13,6 +13,8 @@ import getSyncConfig from '@salesforce/apex/VeleiroMappingController.getSyncConf
 import saveSyncConfig from '@salesforce/apex/VeleiroMappingController.saveSyncConfig';
 import getStatus from '@salesforce/apex/VeleiroMappingController.getStatus';
 import saveToken from '@salesforce/apex/VeleiroMappingController.saveToken';
+import secureLegacyToken from '@salesforce/apex/VeleiroMappingController.secureLegacyToken';
+import confirmSecureConnection from '@salesforce/apex/VeleiroMappingController.confirmSecureConnection';
 import saveEnvironment from '@salesforce/apex/VeleiroMappingController.saveEnvironment';
 
 const ENTITY_OPTIONS = [
@@ -81,6 +83,9 @@ export default class VeleiroMappingHome extends LightningElement {
     // ---- connection status ----
     connected = false;
     tokenSet = false;
+    legacyToken = false;   // token de una version anterior, todavia en el campo publico
+    needsPlatformSetup = false; // token protegido, External Credential todavia no listo
+    platformAuthReady = false;
     statusMessage = 'Checking connection…';
     nextRun = '';
     tokenInput = '';
@@ -108,6 +113,9 @@ export default class VeleiroMappingHome extends LightningElement {
         return getStatus()
             .then((s) => {
                 this.tokenSet = s.tokenSet === 'true';
+                this.legacyToken = s.legacyToken === 'true' && s.canManage === 'true';
+                this.platformAuthReady = s.platformAuthReady === 'true';
+                this.needsPlatformSetup = s.needsPlatformSetup === 'true' && s.canManage === 'true' && !this.legacyToken;
                 this.connected = s.connected === 'true';
                 this.statusMessage = s.message || '';
                 this.nextRun = s.nextRun || '';
@@ -121,7 +129,57 @@ export default class VeleiroMappingHome extends LightningElement {
             .finally(() => { this.checking = false; });
     }
 
+    get showSecureAction() {
+        return this.legacyToken || this.needsPlatformSetup;
+    }
+
+    get secureActionLabel() {
+        return this.legacyToken ? 'Secure the token' : 'Finish secure connection setup';
+    }
+
+    get secureActionNote() {
+        return this.legacyToken
+            ? 'Your API token is still stored the way older versions kept it.'
+            : 'The API token is in protected storage, but the secure connection is not ready yet.';
+    }
+
     handleTokenChange(event) { this.tokenInput = event.detail.value; }
+
+    // Second Apex call, so the secure credential probe runs in its own transaction after the
+    // credential write. A failure only means the secure connection is not ready yet; the
+    // status loaded next reports it.
+    confirmSecure() {
+        return confirmSecureConnection().catch(() => null);
+    }
+
+    // Mueve el token viejo y/o termina la External Credential. Es un clic del admin, nunca la carga.
+    handleSecureToken() {
+        this.checking = true;
+        secureLegacyToken()
+            .then(() => this.confirmSecure())
+            .then(() => this.loadStatus())
+            .then(() => {
+                let title = 'Token moved to protected storage';
+                let message = '';
+                let variant = 'success';
+                if (this.platformAuthReady) {
+                    title = 'Secure connection is ready';
+                } else if (this.legacyToken) {
+                    title = 'Token not moved';
+                    message = 'Try again, or paste the token again to replace it.';
+                    variant = 'warning';
+                } else if (this.needsPlatformSetup) {
+                    title = 'The token is protected. The secure connection could not be finished yet.';
+                    variant = 'warning';
+                }
+                this.dispatchEvent(new ShowToastEvent({ title, message, variant }));
+            })
+            .catch((e) => {
+                this.checking = false;
+                const msg = e && e.body && e.body.message ? e.body.message : 'Could not move the token';
+                this.dispatchEvent(new ShowToastEvent({ title: 'Token not moved', message: msg, variant: 'error' }));
+            });
+    }
 
     handleSaveToken() {
         this.checking = true;
@@ -130,8 +188,9 @@ export default class VeleiroMappingHome extends LightningElement {
         step
             .then(() => {
                 this.tokenInput = '';
-                return this.loadStatus();
+                return token ? this.confirmSecure() : null;
             })
+            .then(() => this.loadStatus())
             .then(() => {
                 if (this.connected) this.editingConn = false; // conectó -> colapsa a la vista resumida
                 this.dispatchEvent(new ShowToastEvent({
